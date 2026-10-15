@@ -726,6 +726,8 @@ a{color:var(--accent);cursor:pointer}
 .ev .p{white-space:pre-wrap;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin-top:4px;max-height:220px;overflow:auto}
 .muted{color:var(--muted)}
 .def{color:var(--muted);font-size:12px;max-width:640px;margin-bottom:4px}
+th.sort{cursor:pointer;user-select:none;white-space:nowrap}th.sort:hover{color:var(--accent)}
+.small{font-size:11px;text-transform:none;letter-spacing:0;font-weight:normal}
 a.small{font-size:11px;text-transform:none;letter-spacing:0;font-weight:normal}
 </style></head><body>
 <header><h1>memviz</h1><span class="meta" id="meta"></span>
@@ -734,6 +736,18 @@ a.small{font-size:11px;text-transform:none;letter-spacing:0;font-weight:normal}
 <main><nav id="nav"></nav><section id="view"></section></main>
 <script>
 let D=null, F={harness:new Set(), kind:new Set()}, Q="";
+let S=JSON.parse(localStorage.sort||'{"key":"mtime","dir":-1}');
+const uses=i=>i.frontmatter?.usage_count==null||i.frontmatter.usage_count===""?null:+i.frontmatter.usage_count;
+const SORTS={harness:i=>i.harness,title:i=>i.title.toLowerCase(),type:i=>i.mtype||KINDS[i.kind],
+  project:i=>home(i.project)||"",uses:uses,mtime:i=>i.mtime||""};
+function sorted(arr){
+  // Missing values (e.g. Claude has no usage_count) always sort last
+  const f=SORTS[S.key]||SORTS.mtime;
+  return [...arr].sort((a,b)=>{const x=f(a),y=f(b);
+    if(x==null&&y==null)return (b.mtime||"").localeCompare(a.mtime||"");
+    if(x==null)return 1; if(y==null)return -1;
+    return (x<y?-1:x>y?1:0)*S.dir||(b.mtime||"").localeCompare(a.mtime||"")});
+}
 const KINDS={memory:"Memory","memory-index":"Index",instructions:"Instructions",rules:"Rules","memory-db":"Memory DB"};
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -803,7 +817,8 @@ function renderNav(){
     const groups=new Map([["(global)",[]]]);
     for(const it of hi){const k=it.scope==="global"?"(global)":it.project;if(!groups.has(k))groups.set(k,[]);groups.get(k).push(it)}
     for(const [k,arr] of groups){ if(!arr.length)continue;
-      arr.sort((a,b)=>(a.kind==="memory-index"?-1:0)-(b.kind==="memory-index"?-1:0)||a.kind.localeCompare(b.kind)||a.title.localeCompare(b.title));
+      const ord=new Map(sorted(arr).map((x,i)=>[x.id,i]));
+      arr.sort((a,b)=>(a.kind==="memory-index"?-1:0)-(b.kind==="memory-index"?-1:0)||a.kind.localeCompare(b.kind)||ord.get(a.id)-ord.get(b.id));
       h+=k==="(global)"?`<div class="proj">Global</div>`:`<div class="proj" data-proj="${esc(hn)}|${esc(k)}">${esc(home(k))}</div>`;
       for(const it of arr){
         const warn=it.notes.length?`<span class="warn" title="${esc(it.notes.join("\n"))}">⚠</span>`:"";
@@ -827,7 +842,7 @@ function overview(){
   if(D.warnings.length)h+="<h3>Collector warnings</h3>"+D.warnings.map(w=>`<div class="note">${esc(w)}</div>`).join("");
   const noted=its.filter(i=>i.notes.length);
   if(noted.length)h+="<h3>Needs attention</h3>"+noted.map(i=>`<div class="note"><a href="#/item/${i.id}">${esc(i.title)}</a> <span class="muted">${esc(home(i.project)||"")}</span>: ${esc(i.notes.join("; "))}</div>`).join("");
-  h+="<h3>Recent memories</h3>"+table([...mem].sort((a,b)=>(b.mtime||"").localeCompare(a.mtime||"")).slice(0,15));
+  h+=`<h3>Memories <span class="small muted">${mem.length} · click a column to sort</span></h3>`+table(mem);
   h+=`<h3>Projects</h3><table class="grid"><tr><th>Harness</th><th>Directory</th><th>Sessions</th><th>Memories</th><th>Last active</th></tr>`;
   for(const p of [...D.projects].sort((a,b)=>(b.last_active||"").localeCompare(a.last_active||""))){
     h+=`<tr class="click" data-proj="${esc(p.harness)}|${esc(p.cwd)}"><td><span class="badge b-${p.harness}">${p.harness}</span></td><td class="path">${esc(home(p.cwd))}${p.exists?"":' <span class="warn" title="directory no longer exists">(missing)</span>'}${p.cwd_exact?"":' <span class="muted" title="decoded from store dir name">(guessed)</span>'}</td><td>${p.sessions}</td><td>${p.memory_count||""}</td><td>${ago(p.last_active)}</td></tr>`;
@@ -836,8 +851,11 @@ function overview(){
 }
 function table(arr){
   if(!arr.length)return '<p class="muted">None.</p>';
-  return `<table class="grid"><tr><th>Harness</th><th>Title</th><th>Type</th><th>Project</th><th>Modified</th></tr>`+arr.map(i=>
-    `<tr class="click" data-id="${i.id}"><td><span class="badge b-${i.harness}">${i.harness}</span></td><td><b>${esc(i.title)}</b><br><span class="muted">${esc(i.description||"")}</span></td><td>${esc(i.mtype||KINDS[i.kind])}</td><td class="path">${esc(home(i.project)||"global")}</td><td>${ago(i.mtime)}</td></tr>`).join("")+"</table>";
+  const th=(k,l,tip="")=>`<th class="sort" data-sort="${k}" title="${esc(tip)}">${l}${S.key===k?(S.dir>0?" ▲":" ▼"):""}</th>`;
+  const u=i=>{const n=uses(i);if(n==null)return `<span class="muted" title="${i.harness==="codex"?"never cited":"not tracked by "+i.harness}">–</span>`;
+    const lu=i.frontmatter.last_usage;return `<span title="${lu?"last cited "+esc(new Date(lu*1000).toLocaleString()):""}">${n}</span>`};
+  return `<table class="grid"><tr>${th("harness","Harness")}${th("title","Title")}${th("type","Type")}${th("project","Project")}${th("uses","Uses",D.glossary.fields.codex.usage_count.def)}${th("mtime","Modified")}</tr>`+sorted(arr).map(i=>
+    `<tr class="click" data-id="${i.id}"><td><span class="badge b-${i.harness}">${i.harness}</span></td><td><b>${esc(i.title)}</b><br><span class="muted">${esc(i.description||"")}</span></td><td>${esc(i.mtype||KINDS[i.kind])}</td><td class="path">${esc(home(i.project)||"global")}</td><td>${u(i)}</td><td>${ago(i.mtime)}</td></tr>`).join("")+"</table>";
 }
 
 function projectView(hn,cwd){
@@ -894,7 +912,9 @@ async function route(){
   else v.innerHTML=overview();
 }
 document.addEventListener("click",e=>{
-  const t=e.target.closest("[data-id],[data-proj],[data-f],#rawtog"); if(!t)return;
+  const t=e.target.closest("[data-sort],[data-id],[data-proj],[data-f],#rawtog"); if(!t)return;
+  if(t.dataset.sort){const k=t.dataset.sort;S=S.key===k?{key:k,dir:-S.dir}:{key:k,dir:k==="uses"||k==="mtime"?-1:1};
+    localStorage.sort=JSON.stringify(S);const v=$("#view"),y=v.scrollTop;route().then(()=>v.scrollTop=y);return}
   if(t.id==="rawtog"){localStorage.raw=localStorage.raw==="1"?"0":"1";route();return}
   if(t.dataset.f){const s=F[t.dataset.f];s.has(t.dataset.v)?s.delete(t.dataset.v):s.add(t.dataset.v);route();return}
   if(t.dataset.id)location.hash="#/item/"+t.dataset.id;
