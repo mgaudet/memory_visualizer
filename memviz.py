@@ -148,6 +148,80 @@ def is_noise_prompt(text):
 
 
 # ---------------------------------------------------------------------------
+# Glossary: what harness-specific fields and concepts mean. Shown inline in
+# the UI next to metadata, and on the Glossary page. `fmt` controls display.
+#
+# Codex definitions are from codex-rs/memories/README.md and
+# codex-rs/state/src/runtime/memories.rs in openai/codex.
+
+GLOSSARY = {
+    "concepts": [
+        {"term": "Memory", "def": "A fact the harness saved for itself so later sessions can use it. "
+         "Claude Code writes these as markdown files during a session; Codex extracts them "
+         "afterwards from finished sessions."},
+        {"term": "Index", "def": "A summary file loaded into context at session start that points at "
+         "the individual memories (Claude's per-project MEMORY.md; Codex's consolidated "
+         "MEMORY.md / memory_summary.md). A memory missing from the index is usually not seen."},
+        {"term": "Instructions", "def": "Hand- or agent-written guidance files the harness always "
+         "loads: CLAUDE.md / CLAUDE.local.md for Claude Code, AGENTS.md for Codex. Project files "
+         "are found by walking up from the session's working directory."},
+        {"term": "Rules", "def": "Claude: ~/.claude/rules/*.md, extra always-loaded instruction files. "
+         "Codex: rules/*.rules, the exec policy (Starlark) deciding which shell commands are "
+         "allowed, prompted, or forbidden. Not prose memory, but persistent learned state."},
+        {"term": "Memory DB", "def": "Codex's SQLite state for its memory pipeline (memories_N.sqlite). "
+         "Holds one stage-1 memory per session plus job bookkeeping."},
+        {"term": "Rollout / thread", "def": "Codex's words for a session transcript "
+         "(~/.codex/sessions/.../rollout-*.jsonl) and its id."},
+        {"term": "Codex phase 1 (stage 1)", "def": "Per-session extraction. When a new Codex session "
+         "starts, a background job picks recent, idle, interactive past sessions and asks a model "
+         "to write a raw_memory and rollout_summary for each. Results are rows in stage1_outputs."},
+        {"term": "Codex phase 2 (consolidation)", "def": "Global merge. A single locked job picks the "
+         "top stage-1 memories (ranked by usage_count, then recency; dropping ones unused for "
+         "max_unused_days), writes them to ~/.codex/memories/ (raw_memories.md, "
+         "rollout_summaries/), then runs a sandboxed sub-agent that updates MEMORY.md, "
+         "memory_summary.md and skills/. Only phase-2 output is what future sessions read."},
+        {"term": "Usage / citation", "def": "Codex counts a memory as used when an agent cites it in "
+         "a response; each citation bumps usage_count and sets last_usage. Heavily cited memories "
+         "survive consolidation; uncited ones age out."},
+    ],
+    "fields": {
+        "claude": {
+            "name": {"def": "Short slug identifying the memory; other memories link to it as [[name]]."},
+            "description": {"def": "One-line summary Claude uses to decide whether the memory is relevant."},
+            "type": {"def": "user = who you are / preferences; feedback = guidance on how to work "
+                     "(with Why / How to apply); project = ongoing work or constraints not in the "
+                     "code; reference = pointers to external resources."},
+            "node_type": {"def": "Internal record kind used by Claude Code's memory store; ordinary "
+                          "memory files are 'memory'."},
+            "originSessionId": {"def": "Id of the Claude Code session that created the memory; the "
+                                "transcript is ~/.claude/projects/<project>/<id>.jsonl."},
+            "modified": {"def": "When Claude Code last wrote the file.", "fmt": "time"},
+        },
+        "codex": {
+            "thread_id": {"def": "Id of the Codex session (rollout) this memory was extracted from."},
+            "rollout_slug": {"def": "Short model-chosen name for the session, used as the summary filename."},
+            "source_updated_at": {"def": "Last-modified time of the session at extraction. If the "
+                                  "session grows later, phase 1 re-extracts it.", "fmt": "time"},
+            "generated_at": {"def": "When phase 1 produced this memory.", "fmt": "time"},
+            "usage_count": {"def": "How many times an agent has cited this memory. Higher counts rank "
+                            "first when phase 2 picks what to keep. Empty = never cited."},
+            "last_usage": {"def": "When the memory was last cited. Memories not used within "
+                           "max_unused_days (falling back to generated_at) are dropped from "
+                           "consolidation.", "fmt": "time"},
+            "selected_for_phase2": {"def": "Whether the last successful consolidation included this "
+                                    "memory, i.e. it is in ~/.codex/memories/ and visible to future "
+                                    "sessions. No = extracted but not (or no longer) in use.",
+                                    "fmt": "bool"},
+            "selected_for_phase2_source_updated_at": {
+                "def": "The source_updated_at of the version phase 2 consumed. If it is older than "
+                       "source_updated_at, the memory was re-extracted since and the consolidated "
+                       "copy is stale until the next phase 2.", "fmt": "time"},
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Collector
 
 
@@ -184,6 +258,7 @@ class Collector:
             "projects": self.projects,
             "items": self.items,
             "warnings": self.warnings,
+            "glossary": GLOSSARY,
         }
 
     # -- shared -------------------------------------------------------------
@@ -449,7 +524,8 @@ class Collector:
                  scope="global", path=str(db), title=db.name,
                  description=f"Codex memory pipeline database, {len(rows)} stage-1 memories",
                  body=summary,
-                 notes=[] if rows else ["No memories recorded yet (is the Codex memories feature enabled?)"])
+                 notes=[] if rows else ["No memories recorded yet. Codex memories are off by default; "
+                                        "enable with `[features] memories = true` in config.toml"])
         for r in rows:
             r = dict(r)
             raw = r.get("raw_memory") or ""
@@ -460,7 +536,10 @@ class Collector:
                      description=(r.get("rollout_summary") or "").strip().split("\n")[0][:200],
                      mtime=iso(r.get("generated_at")), size=len(raw), body=body,
                      frontmatter={k: v for k, v in r.items() if k not in ("raw_memory", "rollout_summary")},
-                     origin={"session_id": r["thread_id"]})
+                     origin={"session_id": r["thread_id"]},
+                     notes=["Re-extracted since the last consolidation; the copy future sessions see is stale"]
+                     if r.get("selected_for_phase2") and (r.get("selected_for_phase2_source_updated_at") or 0)
+                     < (r.get("source_updated_at") or 0) else [])
 
     def codex_origin(self, it):
         sid = (it.get("origin") or {}).get("session_id")
@@ -646,6 +725,8 @@ a{color:var(--accent);cursor:pointer}
 .ev{border-left:3px solid var(--line);padding:4px 12px;margin:8px 0;max-width:900px}
 .ev .p{white-space:pre-wrap;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 10px;margin-top:4px;max-height:220px;overflow:auto}
 .muted{color:var(--muted)}
+.def{color:var(--muted);font-size:12px;max-width:640px;margin-bottom:4px}
+a.small{font-size:11px;text-transform:none;letter-spacing:0;font-weight:normal}
 </style></head><body>
 <header><h1>memviz</h1><span class="meta" id="meta"></span>
 <input id="q" placeholder="Search titles, descriptions, bodies, paths…  (/)">
@@ -687,6 +768,20 @@ function md(src, it){
   }
   flushP();flushL();return out.join("\n");
 }
+function fmtVal(v,g){
+  if(v===null||v===undefined||v==="")return '<span class="muted">–</span>';
+  if(g?.fmt==="time"){const d=typeof v==="number"||/^\d+$/.test(v)?new Date(+v*(+v>1e12?1:1000)):new Date(v);
+    return isNaN(d)?esc(v):`${esc(d.toLocaleString())} <span class="muted">${ago(d.toISOString())}</span>`}
+  if(g?.fmt==="bool")return +v?"yes":"no";
+  return esc(v);
+}
+function glossaryView(){
+  const kindDef=t=>D.glossary.concepts.find(c=>c.term===t);
+  let h="<h2>Glossary</h2><h3>Concepts</h3><table class='kv'>"+D.glossary.concepts.map(c=>`<tr><td><b>${esc(c.term)}</b></td><td>${esc(c.def)}</td></tr>`).join("")+"</table>";
+  for(const [hn,f] of Object.entries(D.glossary.fields))
+    h+=`<h3>${hn==="claude"?"Claude Code":"Codex"} memory fields</h3><table class='kv'>`+Object.entries(f).map(([k,g])=>`<tr><td><code>${esc(k)}</code></td><td>${esc(g.def)}</td></tr>`).join("")+"</table>";
+  return h;
+}
 function findByName(n,it){return D.items.find(x=>x.kind==="memory"&&x.title===n&&(!it||x.project===it.project&&x.harness===it.harness))||D.items.find(x=>x.kind==="memory"&&x.title===n)}
 function findByFile(f,it){const dir=it.path.replace(/[^/]+$/,"");return D.items.find(x=>x.path===dir+f)}
 
@@ -701,7 +796,7 @@ function renderNav(){
   let h='<div class="filters">';
   for(const x of ["claude","codex"])h+=`<span class="chip ${F.harness.has(x)?"on":""}" data-f="harness" data-v="${x}">${x}</span>`;
   for(const [k,v] of Object.entries(KINDS))h+=`<span class="chip ${F.kind.has(k)?"on":""}" data-f="kind" data-v="${k}">${v}</span>`;
-  h+=`</div><div class="it ${!sel?"sel":""}" onclick="location.hash='#/'"><span class="t"><b>Overview</b></span><span class="badge">${items.length}</span></div>`;
+  h+=`</div><div class="it ${!sel&&location.hash!=="#/glossary"&&!location.hash.startsWith("#/project")?"sel":""}" onclick="location.hash='#/'"><span class="t"><b>Overview</b></span><span class="badge">${items.length}</span></div><div class="it ${location.hash==="#/glossary"?"sel":""}" onclick="location.hash='#/glossary'"><span class="t">Glossary</span></div>`;
   for(const hn of ["claude","codex"]){
     const hi=items.filter(i=>i.harness===hn); if(!hi.length)continue;
     h+=`<div class="grp" style="color:var(--${hn})">${hn==="claude"?"Claude Code":"Codex"}</div>`;
@@ -756,7 +851,7 @@ function projectView(hn,cwd){
 
 async function itemView(id){
   const it=D.items.find(i=>i.id===id); if(!it)return '<p>Unknown item.</p>';
-  let h=`<h2>${esc(it.title)}</h2><div><span class="badge b-${it.harness}">${it.harness}</span> <span class="badge">${KINDS[it.kind]}</span> ${it.mtype?`<span class="badge">${esc(it.mtype)}</span>`:""}</div>`;
+  let h=`<h2>${esc(it.title)}</h2><div><span class="badge b-${it.harness}">${it.harness}</span> <span class="badge" title="${esc(D.glossary.concepts.find(c=>c.term===KINDS[it.kind])?.def||"")}">${KINDS[it.kind]}</span> ${it.mtype?`<span class="badge" title="${esc(D.glossary.fields[it.harness]?.type?.def||"")}">${esc(it.mtype)}</span>`:""}</div>`;
   if(it.description)h+=`<p>${esc(it.description)}</p>`;
   h+=it.notes.map(n=>`<div class="note">${esc(n)}</div>`).join("");
   h+=`<h3>Where</h3><table class="kv"><tr><td>File</td><td class="path">${esc(it.path)} <button onclick="navigator.clipboard.writeText(${esc(JSON.stringify(it.path))})">copy</button></td></tr>`;
@@ -764,7 +859,9 @@ async function itemView(id){
   if(it.loaded_by.length)h+=`<tr><td>Loaded in</td><td class="path">${it.loaded_by.map(c=>esc(home(c))).join("<br>")}</td></tr>`;
   h+=`<tr><td>Modified</td><td>${when(it.mtime)} <span class="muted">${ago(it.mtime)}</span></td></tr><tr><td>Size</td><td>${it.size??"–"} bytes</td></tr></table>`;
   const fm=Object.entries(it.frontmatter||{});
-  if(fm.length)h+="<h3>Metadata</h3><table class='kv'>"+fm.map(([k,v])=>`<tr><td>${esc(k)}</td><td>${typeof v==="object"&&v?"<table class=kv>"+Object.entries(v).map(([a,b])=>`<tr><td>${esc(a)}</td><td>${esc(b)}</td></tr>`).join("")+"</table>":esc(v)}</td></tr>`).join("")+"</table>";
+  const row=([k,v])=>{const g=D.glossary.fields[it.harness]?.[k];
+    return `<tr><td>${esc(k)}</td><td>${typeof v==="object"&&v?"<table class=kv>"+Object.entries(v).map(row).join("")+"</table>":fmtVal(v,g)}${g?`<div class="def">${esc(g.def)}</div>`:""}</td></tr>`};
+  if(fm.length)h+="<h3>Metadata <a class='small' href='#/glossary'>glossary</a></h3><table class='kv'>"+fm.map(row).join("")+"</table>";
   const raw=localStorage.raw==="1"||it.lang;
   h+=`<h3>Content <button id="rawtog">${raw?"rendered":"raw"}</button></h3>`;
   h+=raw?`<pre class="raw">${esc(it.body)}</pre>`:`<div class="md">${md(it.body,it)}</div>`;
@@ -793,6 +890,7 @@ async function route(){
   const h=location.hash, v=$("#view"); let m;
   if(m=h.match(/^#\/item\/(\w+)/)){v.innerHTML=await itemView(m[1]);v.scrollTop=0;loadOrigin(m[1])}
   else if(m=h.match(/^#\/project\/(\w+)\/(.*)/))v.innerHTML=projectView(m[1],decodeURIComponent(m[2]));
+  else if(h==="#/glossary")v.innerHTML=glossaryView();
   else v.innerHTML=overview();
 }
 document.addEventListener("click",e=>{

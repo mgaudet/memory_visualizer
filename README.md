@@ -18,7 +18,7 @@ What it collects:
 
 Project directories come from session transcripts. For each memory, the Provenance section
 looks up the session that wrote it (Claude's `originSessionId`, Codex `thread_id`) and shows
-the user prompt behind each write.
+the user prompt behind each write. Field meanings (e.g. Codex phase 1/2) are on the Glossary page.
 
 It also flags memories that `MEMORY.md` doesn't list, index links that point at missing
 files, and project directories that no longer exist.
